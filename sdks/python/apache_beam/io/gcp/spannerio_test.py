@@ -16,7 +16,7 @@
 #
 
 from __future__ import absolute_import
-from builtins import list
+
 import datetime
 import logging
 import random
@@ -25,6 +25,7 @@ import unittest
 
 import mock
 
+import apache_beam as beam
 from apache_beam.testing.test_pipeline import TestPipeline
 from apache_beam.testing.util import assert_that
 from apache_beam.testing.util import equal_to
@@ -33,8 +34,8 @@ from apache_beam.testing.util import equal_to
 # pylint: disable=wrong-import-order, wrong-import-position, ungrouped-imports
 try:
   from google.cloud import spanner
-  # from apache_beam.io.gcp.spannerio import ReadOperation # pylint: disable=unused-import
-  # from apache_beam.io.gcp.spannerio import ReadFromSpanner # pylint: disable=unused-import
+  # from apache_beam.io.gcp.spannerio import (create_transaction, ReadOperation,
+  #                                           ReadFromSpanner) # pylint: disable=unused-import
   from apache_beam.io.gcp.spannerio import * # pylint: disable=unused-import
 except ImportError:
   spanner = None
@@ -66,58 +67,48 @@ def _generate_test_data():
 
 
 @unittest.skipIf(spanner is None, 'GCP dependencies are not installed.')
+@mock.patch('apache_beam.io.gcp.spannerio.Client')
+@mock.patch('apache_beam.io.gcp.spannerio.BatchSnapshot')
 class SpannerReadTest(unittest.TestCase):
 
-  @mock.patch('apache_beam.io.gcp.spannerio.Client')
-  @mock.patch('apache_beam.io.gcp.spannerio.BatchSnapshot')
   def test_read_with_query_batch(self, mock_batch_snapshot_class,
                                  mock_client_class):
-    mock_client = mock.MagicMock()
-    mock_instance = mock.MagicMock()
-    mock_database = mock.MagicMock()
     mock_snapshot = mock.MagicMock()
 
-    mock_client_class.return_value = mock_client
-    mock_client.instance.return_value = mock_instance
-    mock_instance.database.return_value = mock_database
-    mock_database.batch_snapshot.return_value = mock_snapshot
-    mock_batch_snapshot_class.return_value = mock_snapshot
-    mock_batch_snapshot_class.from_dict.return_value = mock_snapshot
-
-    mock_snapshot.to_dict.return_value = dict()
     mock_snapshot.generate_query_batches.return_value = [
         {'query': {'sql': 'SELECT * FROM users'},
          'partition': 'test_partition'} for _ in range(3)]
     mock_snapshot.process_query_batch.side_effect = [
         FAKE_ROWS[0:2], FAKE_ROWS[2:4], FAKE_ROWS[4:]]
 
+    ro = [ReadOperation.query("Select * from users")]
     pipeline = TestPipeline()
-    records = (pipeline
-               | ReadFromSpanner(
-                   project_id=TEST_PROJECT_ID,
-                   instance_id=TEST_INSTANCE_ID,
-                   database_id=_generate_database_name())
-               .with_query('SELECT * FROM users'))
-    pipeline.run()
-    assert_that(records, equal_to(FAKE_ROWS))
 
-  @mock.patch('apache_beam.io.gcp.spannerio.Client')
-  @mock.patch('apache_beam.io.gcp.spannerio.BatchSnapshot')
+    read = (pipeline
+            | 'read' >> ReadFromSpanner(TEST_PROJECT_ID, TEST_INSTANCE_ID,
+                                        _generate_database_name(),
+                                        sql="SELECT * FROM users"))
+
+    readall = (pipeline
+               | 'read all' >> ReadFromSpanner(TEST_PROJECT_ID,
+                                               TEST_INSTANCE_ID,
+                                               _generate_database_name(),
+                                               read_operations=ro))
+
+    readpipeline = (pipeline
+                    | 'create reads' >> beam.Create(ro)
+                    | 'reads' >> ReadFromSpanner(TEST_PROJECT_ID,
+                                                 TEST_INSTANCE_ID,
+                                                 _generate_database_name()))
+
+    pipeline.run()
+    assert_that(read, equal_to(FAKE_ROWS), label='checkRead')
+    assert_that(readall, equal_to(FAKE_ROWS), label='checkReadAll')
+    assert_that(readpipeline, equal_to(FAKE_ROWS), label='checkReadPipeline')
+
   def test_read_with_table_batch(self, mock_batch_snapshot_class,
                                  mock_client_class):
-    mock_client = mock.MagicMock()
-    mock_instance = mock.MagicMock()
-    mock_database = mock.MagicMock()
     mock_snapshot = mock.MagicMock()
-
-    mock_client_class.return_value = mock_client
-    mock_client.instance.return_value = mock_instance
-    mock_instance.database.return_value = mock_database
-    mock_database.batch_snapshot.return_value = mock_snapshot
-    mock_batch_snapshot_class.return_value = mock_snapshot
-    mock_batch_snapshot_class.from_dict.return_value = mock_snapshot
-
-    mock_snapshot.to_dict.return_value = dict()
     mock_snapshot.generate_read_batches.return_value = [{
         'read': {'table': 'users', 'keyset': {'all': True},
                  'columns': ['Key', 'Value'], 'index': ''},
@@ -125,20 +116,44 @@ class SpannerReadTest(unittest.TestCase):
     mock_snapshot.process_read_batch.side_effect = [
         FAKE_ROWS[0:2], FAKE_ROWS[2:4], FAKE_ROWS[4:]]
 
+    ro = [ReadOperation.table("users", ["Key", "Value"])]
     pipeline = TestPipeline()
-    records = (pipeline | ReadFromSpanner(
-        project_id=TEST_PROJECT_ID,
-        instance_id=TEST_INSTANCE_ID,
-        database_id=_generate_database_name())
-               .with_table('users', ['Key', 'Value']))
+
+    read = (pipeline
+            | 'read' >> ReadFromSpanner(TEST_PROJECT_ID, TEST_INSTANCE_ID,
+                                        _generate_database_name(),
+                                        table="users",
+                                        columns=["Key", "Value"]))
+
+    readall = (pipeline
+               | 'read all' >> ReadFromSpanner(TEST_PROJECT_ID,
+                                               TEST_INSTANCE_ID,
+                                               _generate_database_name(),
+                                               read_operations=ro))
+
+    readpipeline = (pipeline
+                    | 'create reads' >> beam.Create(ro)
+                    | 'reads' >> ReadFromSpanner(TEST_PROJECT_ID,
+                                                 TEST_INSTANCE_ID,
+                                                 _generate_database_name()))
+
     pipeline.run()
-    assert_that(records, equal_to(FAKE_ROWS))
+    assert_that(read, equal_to(FAKE_ROWS), label='checkRead')
+    assert_that(readall, equal_to(FAKE_ROWS), label='checkReadAll')
+    assert_that(readpipeline, equal_to(FAKE_ROWS), label='checkReadPipeline')
 
-  @mock.patch('apache_beam.io.gcp.spannerio.Client')
-  @mock.patch('apache_beam.io.gcp.spannerio.BatchSnapshot')
-  def test_read_with_query_transaction(self, mock_batch_snapshot_class,
-                                       mock_client_class):
+    with self.assertRaises(ValueError):
+      # todo: document karo isko, cham pagal ho jaiga warna
+      _ = (pipeline | 'reads error' >> ReadFromSpanner(
+          project_id=TEST_PROJECT_ID,
+          instance_id=TEST_INSTANCE_ID,
+          database_id=_generate_database_name(),
+          table="users"
+      ))
+      pipeline.run()
 
+  def test_read_with_transaction(self, mock_batch_snapshot_class,
+                                 mock_client_class):
     mock_client = mock.MagicMock()
     mock_instance = mock.MagicMock()
     mock_database = mock.MagicMock()
@@ -161,21 +176,68 @@ class SpannerReadTest(unittest.TestCase):
     mock_transaction.__enter__.return_value = mock_transaction_ctx
     mock_transaction_ctx.execute_sql.return_value = FAKE_ROWS
 
-    transaction = ReadFromSpanner.create_transaction(
+    ro = [ReadOperation.query("Select * from users")]
+    p = TestPipeline()
+
+    transaction = (p | create_transaction(
         project_id=TEST_PROJECT_ID, instance_id=TEST_INSTANCE_ID,
         database_id=_generate_database_name(),
-        exact_staleness=datetime.timedelta(seconds=10))
+        exact_staleness=datetime.timedelta(seconds=10)))
 
-    pipeline = TestPipeline()
+    read_query = (p | 'with query' >> ReadFromSpanner(
+        project_id=TEST_PROJECT_ID,
+        instance_id=TEST_INSTANCE_ID,
+        database_id=_generate_database_name(),
+        transaction=transaction,
+        sql="Select * from users"
+    ))
 
-    records = (pipeline
-               | ReadFromSpanner(project_id=TEST_PROJECT_ID,
-                                 instance_id=TEST_INSTANCE_ID,
-                                 database_id=_generate_database_name())
-               .with_transaction(transaction)
-               .with_query('SELECT * FROM users'))
-    pipeline.run()
-    assert_that(records, equal_to(FAKE_ROWS))
+    read_table = (p | 'with table' >> ReadFromSpanner(
+        project_id=TEST_PROJECT_ID,
+        instance_id=TEST_INSTANCE_ID,
+        database_id=_generate_database_name(),
+        transaction=transaction,
+        table="users",
+        columns=["Key", "Value"]
+    ))
+
+    read_all = (p | 'read all' >> ReadFromSpanner(TEST_PROJECT_ID,
+                                                  TEST_INSTANCE_ID,
+                                                  _generate_database_name(),
+                                                  transaction=transaction,
+                                                  read_operations=ro))
+
+    read_all_pipeline = (p
+                         | 'create read operations' >> beam.Create(ro)
+                         | 'reads' >> ReadFromSpanner(TEST_PROJECT_ID,
+                                                      TEST_INSTANCE_ID,
+                                                      _generate_database_name(),
+                                                      transaction=transaction))
+
+    p.run()
+
+    assert_that(read_query, equal_to(FAKE_ROWS), label='checkQuery')
+    assert_that(read_table, equal_to(FAKE_ROWS), label='checkTable')
+    assert_that(read_all, equal_to(FAKE_ROWS), label='checkReadAll')
+    assert_that(read_all_pipeline, equal_to(FAKE_ROWS),
+                label='checkReadPipeline')
+
+    with self.assertRaises(ValueError):
+      # todo: document karo isko, cham pagal ho jaiga warna
+      _ = (p
+           | 'create read operations2' >> beam.Create(ro)
+           | 'reads with error' >> ReadFromSpanner(
+              TEST_PROJECT_ID, TEST_INSTANCE_ID, _generate_database_name(),
+              transaction=transaction, read_operations=ro))
+      p.run()
+
+
+
+
+
+
+
+
 
 
 ###############################################################################
@@ -192,10 +254,8 @@ def pp(x, *args, **kwargs):
   # })
 
 
-
-
 _spanner_key = 0
-import apache_beam as beam
+
 def _m(v):
   global _spanner_key
   _spanner_key += 1
@@ -253,7 +313,7 @@ class SpannerWriteTest(unittest.TestCase):
       print("arraximum size sub-matrix is: ")
       for i in range(max_of_i, max_of_i - max_of_tmp_arr, -1):
         for j in range(max_of_j, max_of_j - max_of_tmp_arr, -1):
-          print arr[i][j],
+          print(arr[i][j], end='')
         print("")
 
     M = [[0, 1, 1, 0, 1],
@@ -315,7 +375,7 @@ class SpannerWriteTest(unittest.TestCase):
     #     MutationGroup([_m(7)]),
     #     MutationGroup([_m(8)]),
     # ])
-    testfn = _BatchableFilterFn(150L, None, None)
+    testfn = _BatchableFilterFn(150, None, None)
 
     # with TestPipeline() as p:
     #   r = p | beam.Create(mutation_groups) | beam.ParDo(testfn) | beam.Map(pp)
@@ -331,14 +391,12 @@ class SpannerWriteTest(unittest.TestCase):
 
       tt = _WriteGroup(
           project_id=None, instance_id=None, database_id=None,
-          max_batch_size_bytes=150L,
+          max_batch_size_bytes=150,
           max_num_mutations=None,
           schema_view=None
       )
 
       r = p | beam.Create(mutation_groups) | tt | beam.Map(pp)
-
-
 
 
 

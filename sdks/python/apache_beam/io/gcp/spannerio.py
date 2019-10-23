@@ -15,87 +15,121 @@
 # limitations under the License.
 #
 
-"""
-This is experimental module for reading from Google Cloud Spanner.
-https://cloud.google.com/spanner
+"""Google Cloud Spanner IO
 
-To read from Cloud Spanner, apply ReadFromSpanner transformation.
-It will return a PCollection of list, where each element represents an
-individual row returned from the read operation.
-Both Query and Read APIs are supported. See more information
-about "https://cloud.google.com/spanner/docs/reads".
+This is an experimental module for reading and writing data from Google Cloud
+Spanner. Visit: https://cloud.google.com/spanner for more details.
 
-To execute a "query", specify a "ReadFromSpanner.with_query(QUERY_STRING)"
-during the construction of the transform. For example:
+To read from Cloud Spanner apply ReadFromSpanner transformation. It will
+return a list, where each element represents an individual row returned from
+the read operation. Both Query and Read APIs are supported.
 
-    records = (pipeline | ReadFromSpanner(PROJECT_ID, INSTANCE_ID, DB_NAME)
-                  .with_query('SELECT * FROM users'))
+ReadFromSpanner relies on the ReadOperation objects which is exposed by the
+SpannerIO API. ReadOperation holds the immutable data which is responsible to
+execute batch and naive reads on spanner cloud. This is done for more
+convenient programming.
 
-To use the read API, specify a "ReadFromSpanner.with_table(TABLE_NAME, COLUMNS)"
-during the construction of the transform. For example:
+ReadFromSpanner read from cloud spanner by providing the either 'sql' param
+in the constructor or 'table' name with 'columns' as list. For example:::
 
-    records = (pipeline | ReadFromSpanner(PROJECT_ID, INSTANCE_ID, DB_NAME)
-                  .with_table("users", ["id", "name", "email"]))
+  records = (pipeline
+            | ReadFromSpanner(PROJECT_ID, INSTANCE_ID, DB_NAME,
+            sql='Select * from users'))
 
-"ReadFromSpanner.with_table" also support indexes by specifying the "index"
-parameter. For more information, the spanner read with index documentation:
-https://cloud.google.com/spanner/docs/secondary-indexes#read-with-index
+  records = (pipeline
+            | ReadFromSpanner(PROJECT_ID, INSTANCE_ID, DB_NAME,
+            table='users', columns=['id', 'name', 'email']))
 
+You can also performs the multiple reads by provide the list of ReadOperation
+to the ReadFromSpanner transform constructor. ReadOperation exposes two static
+methods. Use 'query' to perform sql based reads, 'table' to perform read from
+table name. For example:::
 
-It is possible to read several PCollection of ReadOperation within a single
-transaction. Apply ReadFromSpanner.create_transaction() transform, that lazily
-creates a transaction. The result of this transformation can be passed to
-read operation using ReadFromSpanner.with_transaction(). For Example:
+  read_operations = [
+                      ReadOperation.table('customers', ['name', 'email']),
+                      ReadOperation.table('vendors', ['name', 'email']),
+                    ]
+  all_users = pipeline | ReadFromSpanner(PROJECT_ID, INSTANCE_ID, DB_NAME,
+        read_operations=read_operations)
 
-    transaction = ReadFromSpanner.create_transaction(
-        project_id=PROJECT_ID,
-        instance_id=sINSTANCE_ID,
-        database_id=DB_NAME,
-        exact_staleness=datetime.timedelta(seconds=100))
+  ...OR...
 
-    spanner_read = ReadFromSpanner(
-        project_id=PROJECT_ID,
-        instance_id=INSTANCE_ID,
-        database_id=DB_NAME)
+  read_operations = [
+                      ReadOperation.sql('Select name, email from customers'),
+                      ReadOperation.table('vendors', ['name', 'email']),
+                    ]
+  all_users = pipeline | ReadFromSpanner(PROJECT_ID, INSTANCE_ID, DB_NAME,
+        read_operations=read_operations)
 
-    users = (pipeline
-            | 'Get all users' >> spanner_read.with_transaction(transaction)
-               .with_query("SELECT * FROM users"))
-    tweets = (pipeline
-            | 'Get all tweets' >> spanner_read.with_transaction(transaction)
-             .with_query("SELECT * FROM tweets"))
+For more information, please review the docs on class ReadOperation.
+
+User can also able to provide the ReadOperation in form of PCollection via
+pipeline. For example:::
+
+  users = (pipeline
+           | beam.Create([ReadOperation...])
+           | ReadFromSpanner(PROJECT_ID, INSTANCE_ID, DB_NAME))
+
+User may also create cloud spanner transaction from the transform called
+`create_transaction` which is available in the SpannerIO API.
+
+The transform is guaranteed to be executed on a consistent snapshot of data,
+utilizing the power of read only transactions. Staleness of data can be
+controlled by providing the `read_timestamp` or `exact_staleness` param values
+in the constructor.
+
+This transform requires root of the pipeline (PBegin) and returns the dict
+containing 'session_id' and 'transaction_id'. This `create_transaction`
+PTransform later passed to the constructor of ReadFromSpanner. For example:::
+
+  transaction = (pipeline | create_transaction(TEST_PROJECT_ID,
+                                              TEST_INSTANCE_ID,
+                                              DB_NAME))
+
+  users = pipeline | ReadFromSpanner(PROJECT_ID, INSTANCE_ID, DB_NAME,
+        sql='Select * from users', transaction=transaction)
+
+  tweets = pipeline | ReadFromSpanner(PROJECT_ID, INSTANCE_ID, DB_NAME,
+        sql='Select * from tweets', transaction=transaction)
+
+For further details of this transform, please review the docs on the
+`create_transaction` method available in the SpannerIO API.
+
+ReadFromSpanner takes this transform in the constructor and pass this to the
+read pipeline as the singleton side input.
+
+Writing Data to Spanner
+========================
+
+Work in progress.
 """
 from __future__ import absolute_import
 
-import collections
-import warnings
+from collections import namedtuple
 
 from google.cloud.spanner import Client
 from google.cloud.spanner import KeySet
 from google.cloud.spanner_v1.database import BatchSnapshot
 
-import apache_beam as beam
+from apache_beam import Create
+from apache_beam import DoFn
+from apache_beam import ParDo
+from apache_beam import Reshuffle
+from apache_beam.pvalue import AsSingleton
+from apache_beam.pvalue import PBegin
 from apache_beam.transforms import PTransform
+from apache_beam.transforms import ptransform_fn
 from apache_beam.utils.annotations import experimental
 
-##################################################
-##########   WRITE      ##########################
-##################################################
-from google.cloud.spanner_v1.types import Mutation
-from google.cloud.spanner_v1 import batch
-import sys
+__all__ = ['create_transaction', 'ReadFromSpanner', 'ReadOperation',
+           'WriteToSpanner', 'WriteMutation', 'BatchFn', 'MutationGroup',
+           '_BatchableFilterFn', '_WriteGroup'
+           ]
 
 
-__all__ = [
-    'ReadFromSpanner', 'ReadOperation',
-    'WriteToSpanner', 'WriteMutation', 'BatchFn', 'MutationGroup',
-    '_BatchableFilterFn', '_WriteGroup'
-]
-
-
-class ReadOperation(collections.namedtuple("ReadOperation",
-                                           ["read_operation", "batch_action",
-                                            "transaction_action", "kwargs"])):
+class ReadOperation(namedtuple("ReadOperation",
+                               ["read_operation", "batch_action",
+                                "transaction_action", "kwargs"])):
   """
   Encapsulates a spanner read operation.
   """
@@ -103,7 +137,21 @@ class ReadOperation(collections.namedtuple("ReadOperation",
   __slots__ = ()
 
   @classmethod
-  def with_query(cls, sql, params=None, param_types=None):
+  def query(cls, sql, params=None, param_types=None):
+    """
+    A convenient method to construct ReadOperation from sql query.
+
+    Args:
+      sql: SQL query statement
+      params: (optional) values for parameter replacement. Keys must match the
+        names used in sql
+      param_types: (optional) maps explicit types for one or more param values;
+        required if parameters are passed.
+    """
+
+    if params:
+      assert param_types is not None
+
     return cls(
         read_operation="process_query_batch",
         batch_action="generate_query_batches", transaction_action="execute_sql",
@@ -111,7 +159,18 @@ class ReadOperation(collections.namedtuple("ReadOperation",
     )
 
   @classmethod
-  def with_table(cls, table, columns, index="", keyset=None):
+  def table(cls, table, columns, index="", keyset=None):
+    """
+    A convenient method to construct ReadOperation from table.
+
+    Args:
+      table: name of the table from which to fetch data.
+      columns: names of columns to be retrieved.
+      index: (optional) name of index to use, rather than the table's primary
+        key.
+      keyset: (optional) `KeySet` keys / ranges identifying rows to be
+        retrieved.
+    """
     keyset = keyset or KeySet(all_=True)
     if not isinstance(keyset, KeySet):
       raise ValueError("keyset must be an instance of class "
@@ -124,11 +183,14 @@ class ReadOperation(collections.namedtuple("ReadOperation",
     )
 
 
-class _BeamSpannerConfiguration(collections.namedtuple(
+class _BeamSpannerConfiguration(namedtuple(
     "_BeamSpannerConfiguration", ["project", "instance", "database",
-                                  "credentials", "user_agent", "pool",
+                                  "credentials", "pool",
                                   "snapshot_read_timestamp",
                                   "snapshot_exact_staleness"])):
+  """
+  It holds the immutable data of the connection string to the cloud spanner.
+  """
 
   @property
   def snapshot_options(self):
@@ -140,96 +202,18 @@ class _BeamSpannerConfiguration(collections.namedtuple(
     return snapshot_options
 
 
-class ReadFromSpanner(object):
+class _NaiveSpannerReadDoFn(DoFn):
 
-  def __init__(self, project_id, instance_id, database_id, pool=None,
-               read_timestamp=None, exact_staleness=None, credentials=None,
-               user_agent=None):
+  def __init__(self, spanner_configuration):
     """
-    Read from Google Spanner.
+    A naive version of Spanner read which uses the transaction API of the
+    cloud spanner.
+    https://googleapis.dev/python/spanner/latest/transaction-api.html
 
     Args:
-      project_id: The ID of the project which owns the instances, tables
-        and data.
-      instance_id: The ID of the instance.
-      database_id: The ID of the database instance.
-      user_agent: (Optional) The user agent to be used with API request.
-      pool: (Optional) session pool to be used by database.
-      read_timestamp: (Optional) Execute all reads at the given timestamp.
-      exact_staleness: (Optional) Execute all reads at a timestamp that is
-        ``exact_staleness`` old.
+      spanner_configuration: (_BeamSpannerConfiguration) Connection details to
+        connect with cloud spanner.
     """
-    warnings.warn("ReadFromSpanner is experimental.", FutureWarning,
-                  stacklevel=2)
-    self._transaction = None
-    self._options = _BeamSpannerConfiguration(
-        project=project_id, instance=instance_id, database=database_id,
-        credentials=credentials, user_agent=user_agent, pool=pool,
-        snapshot_read_timestamp=read_timestamp,
-        snapshot_exact_staleness=exact_staleness
-    )
-
-  def with_query(self, sql, params=None, param_types=None):
-    read_operation = [ReadOperation.with_query(sql, params, param_types)]
-    return self.read_all(read_operation)
-
-  def with_table(self, table, columns, index="", keyset=None):
-    read_operation = [ReadOperation.with_table(
-        table=table, columns=columns, index=index, keyset=keyset
-    )]
-    return self.read_all(read_operation)
-
-  def read_all(self, read_operations):
-    if self._transaction is None:
-      return _BatchRead(read_operations=read_operations,
-                        spanner_configuration=self._options)
-    else:
-      return _NaiveSpannerRead(transaction=self._transaction,
-                               read_operations=read_operations,
-                               spanner_configuration=self._options)
-
-  @staticmethod
-  @experimental(extra_message="(ReadFromSpanner)")
-  def create_transaction(project_id, instance_id, database_id, credentials=None,
-                         user_agent=None, pool=None, read_timestamp=None,
-                         exact_staleness=None):
-    """
-    Return the snapshot state for reuse in transaction.
-
-    Args:
-      project_id: The ID of the project which owns the instances, tables
-        and data.
-      instance_id: The ID of the instance.
-      database_id: The ID of the database instance.
-      credentials: (Optional) The OAuth2 Credentials to use for this client.
-      user_agent: (Optional) The user agent to be used with API request.
-      pool: (Optional) session pool to be used by database.
-      read_timestamp: (Optional) Execute all reads at the given timestamp.
-      exact_staleness: (Optional) Execute all reads at a timestamp that is
-        ``exact_staleness`` old.
-      """
-    _snapshot_options = {}
-    if read_timestamp:
-      _snapshot_options['read_timestamp'] = read_timestamp
-    if exact_staleness:
-      _snapshot_options['exact_staleness'] = exact_staleness
-
-    spanner_client = Client(project=project_id, credentials=credentials,
-                            user_agent=user_agent)
-    instance = spanner_client.instance(instance_id)
-    database = instance.database(database_id, pool=pool)
-    snapshot = database.batch_snapshot(**_snapshot_options)
-    return snapshot.to_dict()
-
-  def with_transaction(self, transaction):
-    self._transaction = transaction
-    return self
-
-
-class _NaiveSpannerReadDoFn(beam.DoFn):
-
-  def __init__(self, snapshot_dict, spanner_configuration):
-    self._snapshot_dict = snapshot_dict
     self._spanner_configuration = spanner_configuration
     self._snapshot = None
 
@@ -237,89 +221,167 @@ class _NaiveSpannerReadDoFn(beam.DoFn):
     return self.to_runner_api_pickled(context)
 
   def setup(self):
+    # setting up client to connect with cloud spanner
     spanner_client = Client(self._spanner_configuration.project)
     instance = spanner_client.instance(self._spanner_configuration.instance)
-    database = instance.database(self._spanner_configuration.database,
-                                 pool=self._spanner_configuration.pool)
-    self._snapshot = BatchSnapshot.from_dict(database, self._snapshot_dict)
+    self._database = instance.database(self._spanner_configuration.database,
+                                       pool=self._spanner_configuration.pool)
+
+  def process(self, element, transaction_info):
+    # We used batch snapshot to reuse the same transaction passed through the
+    # side input
+    self._snapshot = BatchSnapshot.from_dict(self._database, transaction_info)
+
+    # getting the transaction from the snapshot's session to run read operation.
+    with self._snapshot._get_session().transaction() as transaction:
+      if element.transaction_action == 'execute_sql':
+        transaction_read = transaction.execute_sql
+      elif element.transaction_action == 'read':
+        transaction_read = transaction.read
+      else:
+        raise ValueError("Not implemented ")
+
+      for row in transaction_read(**element.kwargs):
+        yield row
+
+  def teardown(self):
+    # close the connection
+    if self._snapshot:
+      self._snapshot.close()
+
+
+class _CreateReadPartitions(DoFn):
+  """
+  A DoFn to create partitions. Uses the Partitioning API (PartitionRead /
+  PartitionQuery) request to start a partitioned query operation. Returns a
+  list of batch information needed to perform the actual queries.
+
+  If the element is the instance of :class:`ReadOperation` is to perform sql
+  query, `PartitionQuery` API is used the create partitions and returns mappings
+  of information used perform actual partitioned reads via
+  :meth:`process_query_batch`.
+
+  If the element is the instance of :class:`ReadOperation` is to perform read
+  from table, `PartitionRead` API is used the create partitions and returns
+  mappings of information used perform actual partitioned reads via
+  :meth:`process_read_batch`.
+  """
+
+  def __init__(self, spanner_configuration):
+    self._spanner_configuration = spanner_configuration
+
+  def to_runner_api_parameter(self, context):
+    return self.to_runner_api_pickled(context)
+
+  def setup(self):
+    spanner_client = Client(project=self._spanner_configuration.project,
+                            credentials=self._spanner_configuration.credentials)
+    instance = spanner_client.instance(self._spanner_configuration.instance)
+    self._database = instance.database(self._spanner_configuration.database,
+                                       pool=self._spanner_configuration.pool)
+    self._snapshot = self._database.batch_snapshot(**self._spanner_configuration
+                                                   .snapshot_options)
+    self._snapshot_dict = self._snapshot.to_dict()
 
   def process(self, element):
-    with self._snapshot._get_session().transaction() as transaction:
-      for row in getattr(transaction, element.transaction_action)(
-          **element.kwargs):
-        yield row
+    if element.batch_action == 'generate_query_batches':
+      partitioning_action = self._snapshot.generate_query_batches
+    elif element.batch_action == 'generate_read_batches':
+      partitioning_action = self._snapshot.generate_read_batches
+
+    for p in partitioning_action(**element.kwargs):
+      yield {"read_operation": element.read_operation, "partitions": p,
+             "transaction_info": self._snapshot_dict}
 
   def teardown(self):
     if self._snapshot:
       self._snapshot.close()
 
 
-class _NaiveSpannerRead(PTransform):
+class _CreateTransactionFn(DoFn):
   """
-  A naive version of Spanner read that use transactions for read and execute
-  sql methods from the previous state.
-  """
+  A DoFn to create the transaction of cloud spanner.
+  It connects to the database and and returns the transaction_id and session_id
+  by using the batch_snapshot.to_dict() method available in the google cloud
+  spanner sdk.
 
-  def __init__(self, transaction, read_operations, spanner_configuration):
-    self._transaction = transaction
-    self._read_operations = read_operations
-    self._spanner_configuration = spanner_configuration
-
-  def expand(self, pbegin):
-    return (pbegin
-            | 'Add Read Operations' >> beam.Create(self._read_operations)
-            | 'Reshuffle' >> beam.Reshuffle()
-            | 'Perform Read' >> beam.ParDo(
-                _NaiveSpannerReadDoFn(
-                    snapshot_dict=self._transaction,
-                    spanner_configuration=self._spanner_configuration
-                )))
-
-
-class _BatchRead(PTransform):
-  """
-  This transform uses the Cloud Spanner BatchSnapshot to perform reads from
-  multiple partitions.
+  https://googleapis.dev/python/spanner/latest/database-api.html?highlight=
+  batch_snapshot#google.cloud.spanner_v1.database.BatchSnapshot.to_dict
   """
 
-  def __init__(self, read_operations, spanner_configuration):
+  def __init__(self, project_id, instance_id, database_id, credentials,
+               pool, read_timestamp,
+               exact_staleness):
+    self._project_id = project_id
+    self._instance_id = instance_id
+    self._database_id = database_id
+    self._credentials = credentials
+    self._pool = pool
 
-    if not isinstance(spanner_configuration, _BeamSpannerConfiguration):
-      raise ValueError("spanner_configuration must be a valid "
-                       "_BeamSpannerConfiguration object.")
+    self._snapshot_options = {}
+    if read_timestamp:
+      self._snapshot_options['read_timestamp'] = read_timestamp
+    if exact_staleness:
+      self._snapshot_options['exact_staleness'] = exact_staleness
+    self._snapshot = None
 
-    self._read_operations = read_operations
-    self._spanner_configuration = spanner_configuration
+  def to_runner_api_parameter(self, context):
+    return self.to_runner_api_pickled(context)
 
-  def expand(self, pbegin):
-    spanner_client = Client(project=self._spanner_configuration.project,
-                            credentials=self._spanner_configuration.credentials,
-                            user_agent=self._spanner_configuration.user_agent)
-    instance = spanner_client.instance(self._spanner_configuration.instance)
-    database = instance.database(self._spanner_configuration.database,
-                                 pool=self._spanner_configuration.pool)
-    snapshot = database.batch_snapshot(**self._spanner_configuration
-                                       .snapshot_options)
+  def setup(self):
+    self._spanner_client = Client(project=self._project_id,
+                                  credentials=self._credentials)
+    self._instance = self._spanner_client.instance(self._instance_id)
+    self._database = self._instance.database(self._database_id, pool=self._pool)
 
-    reads = [
-        {"read_operation": ro.read_operation, "partitions": p}
-        for ro in self._read_operations
-        for p in getattr(snapshot, ro.batch_action)(**ro.kwargs)
-    ]
+  def process(self, element, *args, **kwargs):
+    self._snapshot = self._database.batch_snapshot(**self._snapshot_options)
+    return [self._snapshot.to_dict()]
 
-    return (pbegin
-            | 'Generate Partitions' >> beam.Create(reads)
-            | 'Reshuffle' >> beam.Reshuffle()
-            | 'Read From Partitions' >> beam.ParDo(
-                _ReadFromPartitionFn(
-                    snapshot_dict=snapshot.to_dict(),
-                    spanner_configuration=self._spanner_configuration)))
+  def teardown(self):
+    if self._snapshot:
+      self._snapshot.close()
 
 
-class _ReadFromPartitionFn(beam.DoFn):
+@ptransform_fn
+def create_transaction(pbegin, project_id, instance_id, database_id,
+                       credentials=None, pool=None, read_timestamp=None,
+                       exact_staleness=None):
+  """
+  A PTransform method to create a batch transaction.
 
-  def __init__(self, snapshot_dict, spanner_configuration):
-    self._snapshot_dict = snapshot_dict
+  Args:
+    pbegin: Root of the pipeline
+    project_id: Cloud spanner project id. Be sure to use the Project ID,
+      not the Project Number.
+    instance_id: Cloud spanner instance id.
+    database_id: Cloud spanner database id.
+    credentials: (optional) The authorization credentials to attach to requests.
+      These credentials identify this application to the service.
+      If none are specified, the client will attempt to ascertain
+      the credentials from the environment.
+    pool: (optional) session pool to be used by database. If not passed, the
+      database will construct an instance of BurstyPool.
+    read_timestamp: (optional) An instance of the `datetime.datetime` object to
+      execute all reads at the given timestamp.
+    exact_staleness: (optional) And instance of `datetime.timedelta` object to
+      execute all reads at a timestamp that is exact_staleness old.
+  """
+
+  assert isinstance(pbegin, PBegin)
+
+  return (pbegin | Create([1]) | ParDo(_CreateTransactionFn(
+      project_id, instance_id, database_id, credentials,
+      pool, read_timestamp,
+      exact_staleness)))
+
+
+class _ReadFromPartitionFn(DoFn):
+  """
+  A DoFn to perform reads from the partition.
+  """
+
+  def __init__(self, spanner_configuration):
     self._spanner_configuration = spanner_configuration
 
   def to_runner_api_parameter(self, context):
@@ -330,14 +392,23 @@ class _ReadFromPartitionFn(beam.DoFn):
     instance = spanner_client.instance(self._spanner_configuration.instance)
     self._database = instance.database(self._spanner_configuration.database,
                                        pool=self._spanner_configuration.pool)
+    self._snapshot = self._database.batch_snapshot(**self._spanner_configuration
+                                                   .snapshot_options)
 
   def process(self, element):
-    self._snapshot = BatchSnapshot.from_dict(self._database,
-                                             self._snapshot_dict)
-    read_operation = element['read_operation']
-    elem = element['partitions']
+    self._snapshot = BatchSnapshot.from_dict(
+        self._database,
+        element['transaction_info']
+    )
 
-    for row in getattr(self._snapshot, read_operation)(elem):
+    if element['read_operation'] == 'process_query_batch':
+      read_action = self._snapshot.process_query_batch
+    elif element['read_operation'] == 'process_read_batch':
+      read_action = self._snapshot.process_read_batch
+    else:
+      raise ValueError("Unknown read action.")
+
+    for row in read_action(element['partitions']):
       yield row
 
   def teardown(self):
@@ -345,16 +416,127 @@ class _ReadFromPartitionFn(beam.DoFn):
       self._snapshot.close()
 
 
+@experimental()
+class ReadFromSpanner(PTransform):
+  """
+  A PTransform to perform reads from cloud spanner.
+  ReadFromSpanner uses BatchAPI to perform all read operations.
+  """
+
+  def __init__(self, project_id, instance_id, database_id, pool=None,
+               read_timestamp=None, exact_staleness=None, credentials=None,
+               sql=None, params=None, param_types=None,  # with_query
+               table=None, columns=None, index="", keyset=None,  # with_table
+               read_operations=None,  # for read all
+               transaction=None
+               ):
+    """
+    A PTransform that uses Spanner Batch API to perform reads.
+
+    Args:
+      project_id: Cloud spanner project id. Be sure to use the Project ID,
+        not the Project Number.
+      instance_id: Cloud spanner instance id.
+      database_id: Cloud spanner database id.
+      pool: (optional) session pool to be used by database. If not passed, the
+        database will construct an instance of BurstyPool.
+      read_timestamp: (optional) An instance of the `datetime.datetime` object
+        to execute all reads at the given timestamp.
+      exact_staleness: (optional) And instance of `datetime.timedelta` object
+        to execute all reads at a timestamp that is exact_staleness old.
+      credentials: (optional) The authorization credentials to attach to
+        requests. These credentials identify this application to the service.
+        If none are specified, the client will attempt to ascertain
+        the credentials from the environment.
+      sql: (optional) SQL query statement
+      params: (optional) Values for parameter replacement. Keys must match the
+        names used in sql.
+      param_types: (optional) maps explicit types for one or more param values;
+        required if params are passed.
+      table: (optional) Name of the table from which to fetch data.
+      columns: (optional) List of names of columns to be retrieved; required if
+        the table is passed.
+      index: (optional) name of index to use, rather than the table's primary
+        key.
+      keyset: (optional) keys / ranges identifying rows to be retrieved.
+      read_operations: (optional) List of the objects of :class:`ReadOperation`
+        to perform read all.
+      transaction: (optional) PTransform of the :meth:`create_transaction` to
+        perform naive read on cloud spanner.
+    """
+    self._configuration = _BeamSpannerConfiguration(
+        project=project_id, instance=instance_id, database=database_id,
+        credentials=credentials, pool=pool,
+        snapshot_read_timestamp=read_timestamp,
+        snapshot_exact_staleness=exact_staleness
+    )
+
+    self._read_operations = read_operations
+    self._transaction = transaction
+
+    if self._read_operations is None:
+      if table is not None:
+        if columns is None:
+          raise ValueError("Columns are required with the table name.")
+        self._read_operations = [ReadOperation.table(
+            table=table, columns=columns, index=index, keyset=keyset)]
+      elif sql is not None:
+        self._read_operations = [ReadOperation.query(
+            sql=sql, params=params, param_types=param_types)]
+
+  def expand(self, pbegin):
+    if self._read_operations is not None and isinstance(pbegin,
+                                                        PBegin):
+      pcoll = pbegin.pipeline | Create(self._read_operations)
+    elif not isinstance(pbegin, PBegin):
+      if self._read_operations is not None:
+        raise ValueError("Read operation in the constructor only works with "
+                         "the root of the pipeline.")
+      pcoll = pbegin
+    else:
+      raise ValueError("Spanner required read operation, sql or table "
+                       "with columns.")
+
+    if self._transaction is None:
+      # reading as batch read
+      p = (pcoll
+           | 'Generate Partitions' >> ParDo(_CreateReadPartitions(
+              spanner_configuration=self._configuration))
+           .with_input_types(ReadOperation)
+           | 'Reshuffle' >> Reshuffle()
+           | 'Read From Partitions' >> ParDo(_ReadFromPartitionFn(
+              spanner_configuration=self._configuration)))
+    else:
+      # reading as naive read
+      p = (pcoll
+           | 'Reshuffle' >> Reshuffle().with_input_types(ReadOperation)
+           | 'Perform Read' >> ParDo(
+              _NaiveSpannerReadDoFn(spanner_configuration=self._configuration),
+              AsSingleton(self._transaction)))
+    return p
+
 ###############################################################################
 ###############################################################################
 ###############################################################################
+
+
+####################
+
+import apache_beam as beam
+
+##################################################
+##########   WRITE      ##########################
+##################################################
+from google.cloud.spanner_v1.types import Mutation
+from google.cloud.spanner_v1 import batch
+import sys
 
 from apache_beam.transforms import window
 from builtins import list
 
-xx_Mutator = collections.namedtuple('xx_Mutator', ["mutation", "operation"])
+xx_Mutator = namedtuple('xx_Mutator', ["mutation", "operation"])
 
-class _Mutator(collections.namedtuple('_Mutator', ["mutation", "operation"])):
+class _Mutator(namedtuple('_Mutator', ["mutation", "operation"])):
 
   __slots__ = ()
 
@@ -545,7 +727,7 @@ class BatchFn(beam.DoFn):
   def start_bundle(self):
     print("start_bundle >>> ")
     self._batch = MutationGroup()
-    self._size_in_bytes = 0L
+    self._size_in_bytes = 0
 
 
   def process(self, element):
@@ -560,7 +742,7 @@ class BatchFn(beam.DoFn):
 
     if mg_size + self._size_in_bytes > _max_bytes:
       yield self._batch
-      self._size_in_bytes = 0L
+      self._size_in_bytes = 0
       # print("----------------- daz -----------")
       self._batch = MutationGroup()
 
@@ -633,7 +815,7 @@ class _WriteToSpanner(beam.DoFn):
 class _WriteGroup(PTransform):
 
   def __init__(self, project_id, instance_id, database_id,
-               max_batch_size_bytes=100L,
+               max_batch_size_bytes=100,
                max_num_mutations=None,
                schema_view=None):
     self._project_id = project_id
