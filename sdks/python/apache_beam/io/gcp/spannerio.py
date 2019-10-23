@@ -78,7 +78,19 @@ import apache_beam as beam
 from apache_beam.transforms import PTransform
 from apache_beam.utils.annotations import experimental
 
-__all__ = ['ReadFromSpanner', 'ReadOperation',]
+##################################################
+##########   WRITE      ##########################
+##################################################
+from google.cloud.spanner_v1.types import Mutation
+from google.cloud.spanner_v1 import batch
+import sys
+
+
+__all__ = [
+    'ReadFromSpanner', 'ReadOperation',
+    'WriteToSpanner', 'WriteMutation', 'BatchFn', 'MutationGroup',
+    '_BatchableFilterFn', '_WriteGroup'
+]
 
 
 class ReadOperation(collections.namedtuple("ReadOperation",
@@ -331,3 +343,343 @@ class _ReadFromPartitionFn(beam.DoFn):
   def teardown(self):
     if self._snapshot:
       self._snapshot.close()
+
+
+###############################################################################
+###############################################################################
+###############################################################################
+
+from apache_beam.transforms import window
+from builtins import list
+
+xx_Mutator = collections.namedtuple('xx_Mutator', ["mutation", "operation"])
+
+class _Mutator(collections.namedtuple('_Mutator', ["mutation", "operation"])):
+
+  __slots__ = ()
+
+  @property
+  def byte_size(self):
+    return self.mutation.ByteSize()
+
+
+class MutationGroup(list):
+
+  # todo: Check type safety. This should be list of _Mutator
+
+  @property
+  def byte_size(self):
+    s = 0
+    for m in self.__iter__():
+      s += m.byte_size
+    return s
+
+  def primary(self):
+    return self.__iter__().next()
+
+
+class MutationSizeEstimator:
+
+  def __init__(self, m):
+    self._m = m
+
+  @staticmethod
+  def get_operation(m):
+    pass
+
+
+class WriteMutation:
+
+  @staticmethod
+  def insert(table, columns, values):
+    """Insert one or more new table rows.
+    :type table: str
+    :param table: Name of the table to be modified.
+    :type columns: list of str
+    :param columns: Name of the table columns to be modified.
+    :type values: list of lists
+    :param values: Values to be modified.
+    """
+    return _Mutator(
+        mutation=Mutation(insert=batch._make_write_pb(table, columns, values)),
+        operation='insert'
+    )
+
+
+
+  @staticmethod
+  def update(table, columns, values):
+    """Update one or more existing table rows.
+    :type table: str
+    :param table: Name of the table to be modified.
+    :type columns: list of str
+    :param columns: Name of the table columns to be modified.
+    :type values: list of lists
+    :param values: Values to be modified.
+    """
+    return _Mutator(
+        mutation=Mutation(update=batch._make_write_pb(table, columns, values)),
+        operation='update')
+
+  @staticmethod
+  def insert_or_update(table, columns, values):
+    """Insert/update one or more table rows.
+    :type table: str
+    :param table: Name of the table to be modified.
+    :type columns: list of str
+    :param columns: Name of the table columns to be modified.
+    :type values: list of lists
+    :param values: Values to be modified.
+    """
+    return _Mutator(
+        mutation=Mutation(insert_or_update=batch._make_write_pb(table, columns, values)),
+        operation='insert_or_update')
+
+  @staticmethod
+  def replace(table, columns, values):
+    """Replace one or more table rows.
+    :type table: str
+    :param table: Name of the table to be modified.
+    :type columns: list of str
+    :param columns: Name of the table columns to be modified.
+    :type values: list of lists
+    :param values: Values to be modified.
+    """
+    return _Mutator(
+        mutation=Mutation(replace=batch._make_write_pb(table, columns, values)),
+        operation="replace"
+    )
+
+  @staticmethod
+  def delete(table, keyset):
+    """Delete one or more table rows.
+    :type table: str
+    :param table: Name of the table to be modified.
+    :type keyset: :class:`~google.cloud.spanner_v1.keyset.Keyset`
+    :param keyset: Keys/ranges identifying rows to delete.
+    """
+    delete = Mutation.Delete(table=table, key_set=keyset._to_pb())
+    return _Mutator(
+        mutation=Mutation(delete=delete),
+        operation='delete'
+    )
+
+
+class WriteToSpanner(object):
+
+  def __init__(self, project_id, instance_id, database_id):
+    self._project_id = project_id
+    self._instance_id = instance_id
+    self._database_id = database_id
+
+  def insert(self):
+    return _Insert(self._project_id, self._instance_id, self._database_id)
+
+  def batch(self):
+    pass
+
+
+
+class _BatchWrite(PTransform):
+
+  def __init__(self, project_id, instance_id, database_id):
+    self._project_id = project_id
+    self._instance_id = instance_id
+    self._database_id = database_id
+
+  def expand(self, pcoll):
+    return pcoll | beam.ParDo(_WriteToSpanner(
+        self._project_id, self._instance_id, self._database_id
+    ))
+
+
+
+# @typehints.with_input_types(
+#   typehints.Tuple[str, typehints.List[str],
+#                   typehints.List[typehints.Tuple[T, ...]]])
+class _Insert(PTransform):
+
+  def __init__(self, project_id, instance_id, database_id):
+    self._project_id = project_id
+    self._instance_id = instance_id
+    self._database_id = database_id
+
+  def expand(self, pcoll):
+
+    """
+    SpannerIO.java:914
+    // First, read the Cloud Spanner schema.
+    // Build a set of Mutation groups from the current bundle,
+      // sort them by table/key then split into batches.
+    // Merge the batchable and unbatchable mutations and write to Spanner.
+    """
+    return pcoll | beam.ParDo(_WriteToSpanner(
+        self._project_id, self._instance_id, self._database_id
+    ))
+
+
+
+class MutationSizeEstimator:
+
+  def __init__(self):
+    pass
+
+  @staticmethod
+  def get_operation(m):
+    ops = ('insert', 'insert_or_update', 'replace', 'update', 'delete')
+    for op in ops:
+      if getattr(m, op).table is not None:
+        return op
+    return ValueError("Operation is not defined!")
+
+
+
+
+class BatchFn(beam.DoFn):
+
+  def __init__(self, max_batch_size_bytes, max_num_mutations, schema_view):
+    self._max_batch_size_bytes = max_batch_size_bytes
+    self._max_num_mutations = max_num_mutations
+    self._schema_view = schema_view
+
+  def start_bundle(self):
+    print("start_bundle >>> ")
+    self._batch = MutationGroup()
+    self._size_in_bytes = 0L
+
+
+  def process(self, element):
+    batch_size_bytes = 0
+    batch_cells = 0
+
+    _max_bytes = 1024 * 1024 # 1 mb
+    _max_bytes = self._max_batch_size_bytes
+
+    mg = element
+    mg_size = mg.byte_size
+
+    if mg_size + self._size_in_bytes > _max_bytes:
+      yield self._batch
+      self._size_in_bytes = 0L
+      # print("----------------- daz -----------")
+      self._batch = MutationGroup()
+
+    self._batch.extend(mg)
+    self._size_in_bytes += mg_size
+    # print(">>> ", self._size_in_bytes)
+
+  def finish_bundle(self):
+    # print("finish_bundle >>> ", len(self._batch))
+    yield window.GlobalWindows.windowed_value(self._batch)
+    self._batch = None
+
+
+class _BatchableFilterFn(beam.DoFn):
+
+  OUTPUT_TAG_UNBATCHABLE = 'unbatchable'
+
+  def __init__(self, max_batch_size_bytes, max_num_mutations, schema_view):
+    self._max_batch_size_bytes = max_batch_size_bytes
+    self._max_num_mutations = max_num_mutations
+    self._schema_view = schema_view
+    self._batchable = None
+    self._unbatchable = None
+
+  def process(self, element):
+    _max_bytes = self._max_batch_size_bytes
+    mg = element
+    mg_size = mg.byte_size
+    if mg_size > _max_bytes:
+      yield beam.pvalue.TaggedOutput(
+          _BatchableFilterFn.OUTPUT_TAG_UNBATCHABLE,
+          element)
+    else:
+      yield element
+
+
+class _WriteToSpanner(beam.DoFn):
+
+  def __init__(self, project_id, instance_id, database_id):
+    self._project_id = project_id
+    self._instance_id = instance_id
+    self._database_id = database_id
+    self._db_instance = None
+
+  def to_runner_api_parameter(self, unused_context):
+    pass
+
+  def setup(self):
+    spanner_client = Client(self._project_id)
+    instance = spanner_client.instance(self._instance_id)
+    self._db_instance = instance.database(self._database_id)
+
+
+  def process(self, element):
+    with self._db_instance.batch() as b:
+      b._mutations.extend([x.mutation for x in element])
+
+    return element
+
+  # def process(self, element):
+  #   _id = int(time.time())
+  #   def _process(transaction):
+  #     sql = "INSERT roles (key, rolename) VALUES ({}, 'insert-role-{}')".format(_id, _id)
+  #     transaction.execute_update(sql)
+  #   self._db_instance.run_in_transaction(_process)
+  #   return element
+
+
+
+class _WriteGroup(PTransform):
+
+  def __init__(self, project_id, instance_id, database_id,
+               max_batch_size_bytes=100L,
+               max_num_mutations=None,
+               schema_view=None):
+    self._project_id = project_id
+    self._instance_id = instance_id
+    self._database_id = database_id
+
+    self._max_batch_size_bytes = max_batch_size_bytes
+    self._max_num_mutations = max_num_mutations
+    self._schema_view = schema_view
+
+  def expand(self, pcoll):
+    filter_batchable_mutations = (
+        pcoll
+        | 'Filtering Batchable Murations' >> beam.ParDo(
+        _BatchableFilterFn(self._max_batch_size_bytes, self._max_num_mutations,
+                           self._schema_view)).with_outputs(
+        _BatchableFilterFn.OUTPUT_TAG_UNBATCHABLE,
+        main='batchable')
+    )
+
+    sorting = "" # todo: apply sorting
+
+    batching_batchables = (
+        filter_batchable_mutations['batchable']
+        | beam.ParDo(BatchFn(self._max_batch_size_bytes, None, None))
+    )
+
+    return (
+        (batching_batchables,
+         filter_batchable_mutations[_BatchableFilterFn.OUTPUT_TAG_UNBATCHABLE])
+      | 'Merging batchable and unbatchable' >> beam.Flatten()
+    )
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
