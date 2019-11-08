@@ -106,7 +106,6 @@ from __future__ import absolute_import
 
 from collections import namedtuple
 
-import typing
 from google.cloud.spanner import Client
 from google.cloud.spanner import KeySet
 from google.cloud.spanner_v1.database import BatchSnapshot
@@ -115,7 +114,6 @@ from apache_beam import Create
 from apache_beam import DoFn
 from apache_beam import ParDo
 from apache_beam import Reshuffle
-from apache_beam.metrics import Metrics
 from apache_beam.pvalue import AsSingleton
 from apache_beam.pvalue import PBegin
 from apache_beam.transforms import PTransform
@@ -125,8 +123,8 @@ from apache_beam.utils.annotations import experimental
 
 __all__ = [
     'create_transaction', 'ReadFromSpanner', 'ReadOperation', 'WriteToSpanner',
-    'WriteMutation', '_BatchFn', 'MutationGroup', '_BatchableFilterFn',
-    '_WriteGroup', 'PWriteToSpanner'
+    'WriteMutation', 'BatchFn', 'MutationGroup', '_BatchableFilterFn',
+    '_WriteGroup'
 ]
 
 
@@ -597,6 +595,7 @@ xx_Mutator = namedtuple('xx_Mutator', ["mutation", "operation"])
 
 
 class _Mutator(namedtuple('_Mutator', ["mutation", "operation"])):
+
   __slots__ = ()
 
   @property
@@ -606,6 +605,8 @@ class _Mutator(namedtuple('_Mutator', ["mutation", "operation"])):
 
 class MutationGroup(list):
 
+  # todo: Check type safety. This should be list of _Mutator
+
   @property
   def byte_size(self):
     s = 0
@@ -614,86 +615,20 @@ class MutationGroup(list):
     return s
 
   def primary(self):
-    return next(self.__iter__())
+    return self.__iter__().next()
 
 
-class WriteMutation(object):
+class MutationSizeEstimator:
 
-  def __init__(self,
-               insert=None,
-               update=None,
-               insert_or_update=None,
-               replace=None,
-               delete=None,
-               columns=None,
-               values=None,
-               keyset=None):
-    """
-    A convinient class to create Spanner Mutations for Write.
-    
-    Args:
-      insert: (Optional) Name of the table in which rows will be inserted. If 
-        any of the rows already exist, the write or  transaction fails with 
-        error `ALREADY_EXISTS`.
-      update: (Optional) Name of the table in which existing rows will be 
-        updated. If any of the rows does not already exist, the transaction 
-        fails with error `NOT_FOUND`.
-      insert_or_update: (Optional) Table name in which rows will be written.
-        Like insert, except that if the row already exists, then its column 
-        values are overwritten with the ones provided. Any column values not 
-        explicitly written are preserved.
-      replace: (Optional) Table name in which rows will be replaced. Like 
-        insert, except that if the row already exists, it is deleted, and the 
-        column values provided are inserted instead. Unlike `insert_or_update`, 
-        this means any values not explicitly written become `NULL`.
-      delete: (Optional) Table name from which rows will be deleted. Succeeds 
-        whether or not the named rows were present.
-      columns: The names of the columns in table to be written. The list of 
-        columns must contain enough columns to allow Cloud Spanner to derive 
-        values for all primary key columns in the row(s) to be modified.
-      values: The values to be written. `values` can contain more than one 
-        list of values. If it does, then multiple rows are written, one for 
-        each entry in `values`. Each list in `values` must have exactly as 
-        many entries as there are entries in columns above. Sending multiple 
-        lists is equivalent to sending multiple Mutations, each containing one 
-        `values` entry and repeating table and columns.
-      keyset: The primary keys of the rows within table to delete. Delete is 
-        idempotent. The transaction will succeed even if some or all rows do 
-        not exist.
-    """
-    self._columns = columns
-    self._values = values
-    self._keyset = keyset
+  def __init__(self, m):
+    self._m = m
 
-    self._insert = insert
-    self._update = update
-    self._insert_or_update = update
-    self._replace = replace
-    self._delete = delete
+  @staticmethod
+  def get_operation(m):
+    pass
 
-    if sum([
-        1 for x in [insert, update, insert_or_update, replace, delete]
-        if x is not None
-    ]) != 1:
-      raise ValueError("No or more than one write mutation operation provided.")
 
-  def __call__(self, *args, **kwargs):
-    if self._insert is not None:
-      return WriteMutation.insert(
-          table=self._insert, columns=self._columns, values=self._values)
-    elif self._update is not None:
-      return WriteMutation.update(
-          table=self._update, columns=self._columns, values=self._values)
-    elif self._insert_or_update is not None:
-      return WriteMutation.insert_or_update(
-          table=self._insert_or_update,
-          columns=self._columns,
-          values=self._values)
-    elif self._replace is not None:
-      return WriteMutation.replace(
-          table=self._replace, columns=self._columns, values=self._values)
-    elif self._delete is not None:
-      return WriteMutation.delete(table=self._delete, keyset=self._keyset)
+class WriteMutation:
 
   @staticmethod
   def insert(table, columns, values):
@@ -771,86 +706,119 @@ class WriteToSpanner(object):
     self._instance_id = instance_id
     self._database_id = database_id
 
+  def insert(self):
+    return _Insert(self._project_id, self._instance_id, self._database_id)
 
-class PWriteToSpanner(PTransform):
+  def batch(self):
+    pass
 
-  def __init__(self,
-               project_id,
-               instance_id,
-               database_id,
-               max_batch_size_bytes=100,
-               max_num_mutations=None,
-               schema_view=None,
-               batching=True):
+
+class _BatchWrite(PTransform):
+
+  def __init__(self, project_id, instance_id, database_id):
     self._project_id = project_id
     self._instance_id = instance_id
     self._database_id = database_id
 
+  def expand(self, pcoll):
+    return pcoll | beam.ParDo(
+        _WriteToSpanner(self._project_id, self._instance_id, self._database_id))
+
+
+# @typehints.with_input_types(
+#   typehints.Tuple[str, typehints.List[str],
+#                   typehints.List[typehints.Tuple[T, ...]]])
+class _Insert(PTransform):
+
+  def __init__(self, project_id, instance_id, database_id):
+    self._project_id = project_id
+    self._instance_id = instance_id
+    self._database_id = database_id
+
+  def expand(self, pcoll):
+    """
+    SpannerIO.java:914
+    // First, read the Cloud Spanner schema.
+    // Build a set of Mutation groups from the current bundle,
+      // sort them by table/key then split into batches.
+    // Merge the batchable and unbatchable mutations and write to Spanner.
+    """
+    return pcoll | beam.ParDo(
+        _WriteToSpanner(self._project_id, self._instance_id, self._database_id))
+
+
+class MutationSizeEstimator:
+
+  def __init__(self):
+    pass
+
+  @staticmethod
+  def get_operation(m):
+    ops = ('insert', 'insert_or_update', 'replace', 'update', 'delete')
+    for op in ops:
+      if getattr(m, op).table is not None:
+        return op
+    return ValueError("Operation is not defined!")
+
+
+class BatchFn(beam.DoFn):
+
+  def __init__(self, max_batch_size_bytes, max_num_mutations, schema_view):
     self._max_batch_size_bytes = max_batch_size_bytes
     self._max_num_mutations = max_num_mutations
     self._schema_view = schema_view
 
-  def expand(self, pcoll):
-
-    return (pcoll
-            | "making batches" >>
-            _WriteGroup(max_batch_size_bytes=self._max_batch_size_bytes)
-            | 'Writing to spanner' >> beam.ParDo(
-                _WriteToSpanner(self._project_id, self._instance_id,
-                                self._database_id)))
-
-
-class _BatchFn(beam.DoFn):
-
-  def __init__(
-      self,
-      max_batch_size_bytes,
-  ):
-    self._max_batch_size_bytes = max_batch_size_bytes
-
   def start_bundle(self):
+    print("start_bundle >>> ")
     self._batch = MutationGroup()
     self._size_in_bytes = 0
 
   def process(self, element):
+    batch_size_bytes = 0
+    batch_cells = 0
+
     _max_bytes = self._max_batch_size_bytes
+
     mg = element
     mg_size = mg.byte_size
 
     if mg_size + self._size_in_bytes > _max_bytes:
       yield self._batch
       self._size_in_bytes = 0
+      # print("----------------- daz -----------")
       self._batch = MutationGroup()
 
     self._batch.extend(mg)
     self._size_in_bytes += mg_size
+    # print(">>> ", self._size_in_bytes)
 
   def finish_bundle(self):
+    # print("finish_bundle >>> ", len(self._batch))
     yield window.GlobalWindows.windowed_value(self._batch)
     self._batch = None
 
 
 class _BatchableFilterFn(beam.DoFn):
+
   OUTPUT_TAG_UNBATCHABLE = 'unbatchable'
 
-  def __init__(self, max_batch_size_bytes):
+  def __init__(self, max_batch_size_bytes, max_num_mutations, schema_view):
     self._max_batch_size_bytes = max_batch_size_bytes
+    self._max_num_mutations = max_num_mutations
+    self._schema_view = schema_view
     self._batchable = None
     self._unbatchable = None
 
   def process(self, element):
-    if element.primary().operation == 'delete':
+    _max_bytes = self._max_batch_size_bytes
+    mg = element
+    mg_size = mg.byte_size
+    # Todo: add support to typecheck of unbatchable mutations
+    if mg_size > _max_bytes:
       yield beam.pvalue.TaggedOutput(_BatchableFilterFn.OUTPUT_TAG_UNBATCHABLE,
                                      element)
     else:
-      _max_bytes = self._max_batch_size_bytes
-      mg = element
-      mg_size = mg.byte_size
-      if mg_size > _max_bytes:
-        yield beam.pvalue.TaggedOutput(
-            _BatchableFilterFn.OUTPUT_TAG_UNBATCHABLE, element)
-      else:
-        yield element
+      yield element
 
 
 class _WriteToSpanner(beam.DoFn):
@@ -860,8 +828,6 @@ class _WriteToSpanner(beam.DoFn):
     self._instance_id = instance_id
     self._database_id = database_id
     self._db_instance = None
-    self.queries = Metrics.counter(self.__class__, 'SpannerWrittenRow')
-    self.batches = Metrics.counter(self.__class__, 'SpannerBatches')
 
   def to_runner_api_parameter(self, unused_context):
     pass
@@ -872,48 +838,54 @@ class _WriteToSpanner(beam.DoFn):
     self._db_instance = instance.database(self._database_id)
 
   def process(self, element):
-    # return element
-    self.queries.inc(len(element))
-    self.batches.inc()
     with self._db_instance.batch() as b:
       b._mutations.extend([x.mutation for x in element])
 
-    # yield [b.committed]
+    return element
 
-
-class _MakeMutationGroupsFn(DoFn):
-
-  def process(self, element):
-    if isinstance(element, MutationGroup):
-      yield element
-    elif isinstance(element, _Mutator):
-      yield MutationGroup([element])
-    else:
-      raise ValueError(
-          "Invalid object type. Object must be an intance of MutationGroup or "
-          "WriteMutations")
+  # def process(self, element):
+  #   _id = int(time.time())
+  #   def _process(transaction):
+  #     sql = "INSERT roles (key, rolename) VALUES ({}, 'insert-role-{}')".format(_id, _id)
+  #     transaction.execute_update(sql)
+  #   self._db_instance.run_in_transaction(_process)
+  #   return element
 
 
 class _WriteGroup(PTransform):
 
-  def __init__(self, max_batch_size_bytes=1024, *args, **kwargs):
+  def __init__(self,
+               project_id,
+               instance_id,
+               database_id,
+               max_batch_size_bytes=100,
+               max_num_mutations=None,
+               schema_view=None):
+    self._project_id = project_id
+    self._instance_id = instance_id
+    self._database_id = database_id
+
     self._max_batch_size_bytes = max_batch_size_bytes
+    self._max_num_mutations = max_num_mutations
+    self._schema_view = schema_view
 
   def expand(self, pcoll):
     filter_batchable_mutations = (
         pcoll
-        | 'Making mutation groups' >> ParDo(
-            _MakeMutationGroupsFn()).with_input_types(
-                typing.Union[MutationGroup, _Mutator])
         | 'Filtering Batchable Murations' >> beam.ParDo(
-            _BatchableFilterFn(self._max_batch_size_bytes)).with_outputs(
-                _BatchableFilterFn.OUTPUT_TAG_UNBATCHABLE, main='batchable'))
+            _BatchableFilterFn(
+                self._max_batch_size_bytes, self._max_num_mutations,
+                self._schema_view)).with_outputs(
+                    _BatchableFilterFn.OUTPUT_TAG_UNBATCHABLE, main='batchable')
+    )
 
+    sorting = ""  # todo: apply sorting
     batching_batchables = (
         filter_batchable_mutations['batchable']
-        | beam.ParDo(_BatchFn(self._max_batch_size_bytes)))
+        | beam.ParDo(BatchFn(self._max_batch_size_bytes, None, None)))
 
     return (
         (batching_batchables,
          filter_batchable_mutations[_BatchableFilterFn.OUTPUT_TAG_UNBATCHABLE])
-        | 'Merging batchable and unbatchable' >> beam.Flatten())
+        | 'Merging batchable and unbatchable' >> beam.Flatten()
+        | beam.Reshuffle())

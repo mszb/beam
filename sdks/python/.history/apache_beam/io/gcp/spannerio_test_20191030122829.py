@@ -30,9 +30,6 @@ from apache_beam.testing.test_pipeline import TestPipeline
 from apache_beam.testing.util import assert_that
 from apache_beam.testing.util import equal_to
 
-from apache_beam.metrics import Metrics
-from apache_beam.metrics.metric import MetricsFilter
-
 # Protect against environments where spanner library is not available.
 # pylint: disable=wrong-import-order, wrong-import-position, ungrouped-imports
 try:
@@ -306,8 +303,7 @@ class SpannerReadTest(unittest.TestCase):
 
 def pp(x, *args, **kwargs):
   # print(x)
-  # print('----->> ', len(x))
-  print('----->> ', x.byte_size, len(x))
+  print('-----', x.byte_size)
   # print({
   #     "args": args,
   #     "kw": kwargs
@@ -323,14 +319,7 @@ def _m(v):
   return WriteMutation.insert("roles", ("key", "rolename"), [(_spanner_key, v)])
 
 
-def _d(v):
-  global _spanner_key
-  _spanner_key += 1
-  ks = spanner.KeySet(keys=[[_spanner_key]])
-  return WriteMutation.delete("roles", ks)
-
-
-class ExampleSpannerWriteTest(unittest.TestCase):
+class SpannerWriteTest(unittest.TestCase):
   TEST_INSTANCE_ID = 'testingdb-shoaib-vd'
   DB_NAME = "testdb1"  #from gcp https://console.cloud.google.com/spanner/instances/testingdb-shoaib-vd/details/databases?project=apache-beam-testing
 
@@ -345,151 +334,21 @@ class ExampleSpannerWriteTest(unittest.TestCase):
         WriteMutation.update("roles", ("key", "rolename"),
                              [('1234', "mutations-inset-1233-updated")]),
     ]]
-    p = TestPipeline()
-    (p | beam.Create(m) | WriteToSpanner(TEST_PROJECT_ID, self.TEST_INSTANCE_ID,
-                                         self.DB_NAME).insert())
-    res = p.run()
-    res.wait_until_finish()
-
-    metric_results = res.metrics().query(
-        MetricsFilter().with_name('SpannerWrittenRow'))
-    print(metric_results)
-
-  def test_batch_insert_actual(self):
-    ks = spanner.KeySet(keys=[[1233], [1234]])
-    m = [
-        # MutationGroup([WriteMutation.delete("roles", ks)]),
-        MutationGroup([
-            WriteMutation.insert("roles", ("key", "rolename"),
-                                 [('9001233', "mutations-inset-1233")])
-        ]),
-        MutationGroup([
-            WriteMutation.insert("roles", ("key", "rolename"),
-                                 [('9001234', "mutations-inset-1234")])
-        ]),
-        MutationGroup([
-            WriteMutation.update(
-                "roles", ("key", "rolename"),
-                [('9001234', "mutations-inset-9001233-updated")])
-        ])
-    ]
-
-    m2 = [[
-        WriteMutation.delete("roles", ks),
-        WriteMutation.insert("roles", ("key", "rolename"),
-                             [('1233', "mutations-inset-1233")]),
-        WriteMutation.insert("roles", ("key", "rolename"),
-                             [('1234', "mutations-inset-1234")]),
-        WriteMutation.update("roles", ("key", "rolename"),
-                             [('1234', "mutations-inset-1233-updated")]),
-    ]]
     with TestPipeline() as p:
-      r = p | beam.Create(m2) | WriteToSpanner(
-          TEST_PROJECT_ID,
-          self.TEST_INSTANCE_ID,
-          self.DB_NAME,
-          # max_batch_size_bytes=150,
-      ).insert() | beam.Map(pp)
+      r = p | beam.Create(m) | WriteToSpanner(
+          TEST_PROJECT_ID, self.TEST_INSTANCE_ID, self.DB_NAME).insert()
 
-  def test_FINAL_batch_insert_actual(self):
-    ks = spanner.KeySet(keys=[[1233], [1234]])
-
-    m2 = [
-        WriteMutation.delete("roles", ks),
-        WriteMutation.insert("roles", ("key", "rolename"),
-                             [('1233', "mutations-inset-1233")]),
-        WriteMutation.insert("roles", ("key", "rolename"),
-                             [('1234', "mutations-inset-1234")]),
-        WriteMutation.update("roles", ("key", "rolename"),
-                             [('1234', "mutations-inset-1233-updated")]),
-    ]
-    # with TestPipeline() as p:
-    #   r = p | beam.Create(m2) | PWriteToSpanner(
-    #       TEST_PROJECT_ID,
-    #       self.TEST_INSTANCE_ID,
-    #       self.DB_NAME,
-    #       max_batch_size_bytes=1150,
-    #   ) | beam.Map(pp)
-
-    p = TestPipeline()
-    (p | beam.Create(m2) | PWriteToSpanner(
-        TEST_PROJECT_ID,
-        self.TEST_INSTANCE_ID,
-        self.DB_NAME,
-        max_batch_size_bytes=150,
-    ) | beam.Map(pp))
-    res = p.run()
-    res.wait_until_finish()
-
-    metric_results = res.metrics().query(
-        MetricsFilter().with_name('SpannerWrittenRow'))
-    print(metric_results)
-
-  def test_stream_batch_insert_actual(self):
-    from apache_beam.testing.test_stream import TestStream
-    ks = spanner.KeySet(keys=[[1233], [1234]])
-
-    m1 = [
-        WriteMutation.delete("roles", ks),
-        WriteMutation.insert("roles", ("key", "rolename"),
-                             [('1233', "mutations-inset-1233")]),
-        WriteMutation.insert("roles", ("key", "rolename"),
-                             [('1233', "mutations-inset-1233")]),
-        WriteMutation.insert("roles", ("key", "rolename"),
-                             [('1233', "mutations-inset-1233")]),
-        WriteMutation.insert("roles", ("key", "rolename"),
-                             [('1233', "mutations-inset-1233")]),
-    ]
-
-    m2 = [
-        WriteMutation.insert("roles", ("key", "rolename"),
-                             [('1234', "mutations-inset-1234")]),
-        WriteMutation.update("roles", ("key", "rolename"),
-                             [('1234', "mutations-inset-1233-updated")]),
-        WriteMutation.insert("roles", ("key", "rolename"),
-                             [('1234', "mutations-inset-1234")]),
-        WriteMutation.update("roles", ("key", "rolename"),
-                             [('1234', "mutations-inset-1233-updated")]),
-        WriteMutation.insert("roles", ("key", "rolename"),
-                             [('1234', "mutations-inset-1234")]),
-        WriteMutation.update("roles", ("key", "rolename"),
-                             [('1234', "mutations-inset-1233-updated")]),
-        WriteMutation.insert("roles", ("key", "rolename"),
-                             [('1234', "mutations-inset-1234")]),
-        WriteMutation.update("roles", ("key", "rolename"),
-                             [('1234', "mutations-inset-1233-updated")]),
-        WriteMutation.insert("roles", ("key", "rolename"),
-                             [('1234', "mutations-inset-1234")]),
-        WriteMutation.update("roles", ("key", "rolename"),
-                             [('1234', "mutations-inset-1233-updated")]),
-    ]
-
-    with TestPipeline() as p:
-      test_stream = (
-          TestStream().advance_watermark_to(10).add_elements(m1).add_elements(
-              m2).advance_processing_time(5.1))
-
-      (p
-       | test_stream
-       | PWriteToSpanner(
-           TEST_PROJECT_ID,
-           self.TEST_INSTANCE_ID,
-           self.DB_NAME,
-           max_batch_size_bytes=1150,
-       ) | beam.Map(pp))
-
-  def xtest_batch_size(self):
-    mutation_groups = [
+  def test_batch_size(self):
+    mutation_groups = list([
         MutationGroup([_m(1)]),
         MutationGroup([_m(2)]),
-        MutationGroup([_d(101)]),
         MutationGroup([_m(5), _m(6), _m(7), _m(8),
                        _m(9)]),
         MutationGroup([_m(4)]),
         MutationGroup([_m(3)]),
         MutationGroup([_m(11)]),
         MutationGroup([_m(10)]),
-    ]
+    ])
     # mutation_groups = list([
     #     MutationGroup([_m(1)]),
     #     MutationGroup([_m(2)]),
@@ -522,145 +381,6 @@ class ExampleSpannerWriteTest(unittest.TestCase):
           schema_view=None)
 
       r = p | beam.Create(mutation_groups) | tt | beam.Map(pp)
-
-
-@unittest.skipIf(spanner is None, 'GCP dependencies are not installed.')
-@mock.patch('apache_beam.io.gcp.spannerio.Client')
-@mock.patch('google.cloud.spanner_v1.database.BatchCheckout')
-class SpannerWriteTest(unittest.TestCase):
-
-  def test_write_test1(self, mock_batch_snapshot_class, mock_batch_checkout):
-    # mock_batch_ctx = mock.MagicMock()
-    # mock_batch_checkout.__enter__.return_value = mock_batch_ctx
-
-    ks = spanner.KeySet(keys=[[1233], [1234]])
-
-    m2 = [
-        WriteMutation.delete("roles", ks),
-        WriteMutation.insert("roles", ("key", "rolename"),
-                             [('1233', "mutations-inset-1233")]),
-        WriteMutation.insert("roles", ("key", "rolename"),
-                             [('1234', "mutations-inset-1234")]),
-        WriteMutation.update("roles", ("key", "rolename"),
-                             [('1234', "mutations-inset-1233-updated")]),
-    ]
-
-    p = TestPipeline()
-    (p
-     | beam.Create(m2)
-     | PWriteToSpanner(
-         project_id=TEST_PROJECT_ID,
-         instance_id=TEST_INSTANCE_ID,
-         database_id=_generate_database_name(),
-         max_batch_size_bytes=1024,
-     ) | beam.Map(pp))
-    res = p.run()
-    res.wait_until_finish()
-
-    metric_results = res.metrics().query(MetricsFilter().with_names(
-        ['SpannerWrittenRow', 'SpannerBatches']))
-    written_rows_counter = metric_results['counters'][0]
-    batches_counter = metric_results['counters'][1]
-
-    self.assertEqual(written_rows_counter.committed, 4)
-    self.assertEqual(written_rows_counter.attempted, 4)
-    self.assertEqual(batches_counter.committed, 2)
-    self.assertEqual(batches_counter.attempted, 2)
-
-  def test_write_test3(self, mock_batch_snapshot_class, mock_batch_checkout):
-    # mock_batch_ctx = mock.MagicMock()
-    # mock_batch_checkout.__enter__.return_value = mock_batch_ctx
-
-    ks = spanner.KeySet(keys=[[1233], [1234]])
-
-    m1 = [
-        WriteMutation.delete("roles", ks),
-        WriteMutation.insert("roles", ("key", "rolename"),
-                             [('1234', "mutations-inset-1234")])
-    ] * 50
-
-    p = TestPipeline()
-    (p
-     | beam.Create(m1)
-     | PWriteToSpanner(
-         project_id=TEST_PROJECT_ID,
-         instance_id=TEST_INSTANCE_ID,
-         database_id=_generate_database_name(),
-         max_batch_size_bytes=1024,
-     ) | beam.Map(pp))
-    res = p.run()
-    res.wait_until_finish()
-
-    metric_results = res.metrics().query(MetricsFilter().with_names(
-        ['SpannerWrittenRow', 'SpannerBatches']))
-    written_rows_counter = metric_results['counters'][0]
-    batches_counter = metric_results['counters'][1]
-
-    self.assertEqual(written_rows_counter.committed, 100)
-    self.assertEqual(written_rows_counter.attempted, 100)
-    self.assertEqual(batches_counter.committed, 53)
-    self.assertEqual(batches_counter.attempted, 53)
-
-  def test_write_test2(self, mock_batch_snapshot_class, mock_batch_checkout):
-    # mock_batch_ctx = mock.MagicMock()
-    # mock_batch_checkout.__enter__.return_value = mock_batch_ctx
-
-    ks = spanner.KeySet(keys=[[1233], [1234]])
-    m = [
-        # MutationGroup([WriteMutation.delete("roles", ks)]),
-        MutationGroup([
-            WriteMutation.insert("roles", ("key", "rolename"),
-                                 [('9001233', "mutations-inset-1233")]),
-            WriteMutation.insert("roles", ("key", "rolename"),
-                                 [('9001234', "mutations-inset-1234")])
-        ]),
-        MutationGroup([
-            WriteMutation.delete("roles", ks),
-            WriteMutation.update(
-                "roles", ("key", "rolename"),
-                [('9001234', "mutations-inset-9001233-updated")])
-        ])
-    ]
-
-    p = TestPipeline()
-    (p
-     | beam.Create(m)
-     | PWriteToSpanner(
-         project_id=TEST_PROJECT_ID,
-         instance_id=TEST_INSTANCE_ID,
-         database_id=_generate_database_name(),
-         max_batch_size_bytes=100,
-     ) | beam.Map(pp))
-    res = p.run()
-    res.wait_until_finish()
-
-    metric_results = res.metrics().query(MetricsFilter().with_names(
-        ['SpannerWrittenRow', 'SpannerBatches']))
-    written_rows_counter = metric_results['counters'][0]
-    batches_counter = metric_results['counters'][1]
-
-    self.assertEqual(written_rows_counter.committed, 4)
-    self.assertEqual(written_rows_counter.attempted, 4)
-    self.assertEqual(batches_counter.committed, 3)
-    self.assertEqual(batches_counter.attempted, 3)
-
-  def test_batching(self, mock_batch_snapshot_class, mock_batch_checkout):
-    # test batching
-    # each mutation group byte size is 58
-    m1 = [
-        MutationGroup([
-            WriteMutation.insert("roles", ("key", "rolename"),
-                                 [('1234', "mutations-inset-1234")])
-        ])
-    ] * 50
-
-    with TestPipeline() as p:
-      daz = (
-          p | beam.Create(m1) | beam.ParDo(_BatchFn(1450))
-          | beam.Map(lambda x: len(x))
-          # | beam.Map(pp)
-      )
-      assert_that(daz, equal_to([25, 25]))
 
 
 if __name__ == '__main__':
