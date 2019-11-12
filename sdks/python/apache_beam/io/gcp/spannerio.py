@@ -104,29 +104,35 @@ Work in progress.
 """
 from __future__ import absolute_import
 
+import typing
+from builtins import list
 from collections import namedtuple
 
-import typing
 from google.cloud.spanner import Client
 from google.cloud.spanner import KeySet
+from google.cloud.spanner_v1 import batch
 from google.cloud.spanner_v1.database import BatchSnapshot
+from google.cloud.spanner_v1.proto.mutation_pb2 import Mutation
 
 from apache_beam import Create
 from apache_beam import DoFn
+from apache_beam import Flatten
 from apache_beam import ParDo
 from apache_beam import Reshuffle
 from apache_beam.metrics import Metrics
 from apache_beam.pvalue import AsSingleton
 from apache_beam.pvalue import PBegin
+from apache_beam.pvalue import TaggedOutput
 from apache_beam.transforms import PTransform
 from apache_beam.transforms import ptransform_fn
+from apache_beam.transforms import window
 from apache_beam.transforms.display import DisplayDataItem
 from apache_beam.utils.annotations import experimental
 
 __all__ = [
     'create_transaction', 'ReadFromSpanner', 'ReadOperation', 'WriteToSpanner',
     'WriteMutation', '_BatchFn', 'MutationGroup', '_BatchableFilterFn',
-    '_WriteGroup', 'PWriteToSpanner'
+    '_WriteGroup'
 ]
 
 
@@ -575,25 +581,26 @@ class ReadFromSpanner(PTransform):
     return res
 
 
-###############################################################################
-###############################################################################
-###############################################################################
+class WriteToSpanner(PTransform):
 
-####################
+  def __init__(self,
+               project_id,
+               instance_id,
+               database_id,
+               max_batch_size_bytes=1024):
+    self._project_id = project_id
+    self._instance_id = instance_id
+    self._database_id = database_id
+    self._max_batch_size_bytes = max_batch_size_bytes
 
-import apache_beam as beam
+  def expand(self, pcoll):
 
-##################################################
-##########   WRITE      ##########################
-##################################################
-from google.cloud.spanner_v1.types import Mutation
-from google.cloud.spanner_v1 import batch
-import sys
-
-from apache_beam.transforms import window
-from builtins import list
-
-xx_Mutator = namedtuple('xx_Mutator', ["mutation", "operation"])
+    return (pcoll
+            | "making batches" >>
+            _WriteGroup(max_batch_size_bytes=self._max_batch_size_bytes)
+            | 'Writing to spanner' >> ParDo(
+                _WriteToSpannerDoFn(self._project_id, self._instance_id,
+                                    self._database_id)))
 
 
 class _Mutator(namedtuple('_Mutator', ["mutation", "operation"])):
@@ -605,6 +612,9 @@ class _Mutator(namedtuple('_Mutator', ["mutation", "operation"])):
 
 
 class MutationGroup(list):
+  """
+  A Bundle of Spanner Mutations (_Mutator).
+  """
 
   @property
   def byte_size(self):
@@ -630,35 +640,35 @@ class WriteMutation(object):
                keyset=None):
     """
     A convinient class to create Spanner Mutations for Write.
-    
+
     Args:
-      insert: (Optional) Name of the table in which rows will be inserted. If 
-        any of the rows already exist, the write or  transaction fails with 
+      insert: (Optional) Name of the table in which rows will be inserted. If
+        any of the rows already exist, the write or  transaction fails with
         error `ALREADY_EXISTS`.
-      update: (Optional) Name of the table in which existing rows will be 
-        updated. If any of the rows does not already exist, the transaction 
+      update: (Optional) Name of the table in which existing rows will be
+        updated. If any of the rows does not already exist, the transaction
         fails with error `NOT_FOUND`.
       insert_or_update: (Optional) Table name in which rows will be written.
-        Like insert, except that if the row already exists, then its column 
-        values are overwritten with the ones provided. Any column values not 
+        Like insert, except that if the row already exists, then its column
+        values are overwritten with the ones provided. Any column values not
         explicitly written are preserved.
-      replace: (Optional) Table name in which rows will be replaced. Like 
-        insert, except that if the row already exists, it is deleted, and the 
-        column values provided are inserted instead. Unlike `insert_or_update`, 
+      replace: (Optional) Table name in which rows will be replaced. Like
+        insert, except that if the row already exists, it is deleted, and the
+        column values provided are inserted instead. Unlike `insert_or_update`,
         this means any values not explicitly written become `NULL`.
-      delete: (Optional) Table name from which rows will be deleted. Succeeds 
+      delete: (Optional) Table name from which rows will be deleted. Succeeds
         whether or not the named rows were present.
-      columns: The names of the columns in table to be written. The list of 
-        columns must contain enough columns to allow Cloud Spanner to derive 
+      columns: The names of the columns in table to be written. The list of
+        columns must contain enough columns to allow Cloud Spanner to derive
         values for all primary key columns in the row(s) to be modified.
-      values: The values to be written. `values` can contain more than one 
-        list of values. If it does, then multiple rows are written, one for 
-        each entry in `values`. Each list in `values` must have exactly as 
-        many entries as there are entries in columns above. Sending multiple 
-        lists is equivalent to sending multiple Mutations, each containing one 
+      values: The values to be written. `values` can contain more than one
+        list of values. If it does, then multiple rows are written, one for
+        each entry in `values`. Each list in `values` must have exactly as
+        many entries as there are entries in columns above. Sending multiple
+        lists is equivalent to sending multiple Mutations, each containing one
         `values` entry and repeating table and columns.
-      keyset: The primary keys of the rows within table to delete. Delete is 
-        idempotent. The transaction will succeed even if some or all rows do 
+      keyset: The primary keys of the rows within table to delete. Delete is
+        idempotent. The transaction will succeed even if some or all rows do
         not exist.
     """
     self._columns = columns
@@ -764,43 +774,10 @@ class WriteMutation(object):
     return _Mutator(mutation=Mutation(delete=delete), operation='delete')
 
 
-class WriteToSpanner(object):
-
-  def __init__(self, project_id, instance_id, database_id):
-    self._project_id = project_id
-    self._instance_id = instance_id
-    self._database_id = database_id
-
-
-class PWriteToSpanner(PTransform):
-
-  def __init__(self,
-               project_id,
-               instance_id,
-               database_id,
-               max_batch_size_bytes=100,
-               max_num_mutations=None,
-               schema_view=None,
-               batching=True):
-    self._project_id = project_id
-    self._instance_id = instance_id
-    self._database_id = database_id
-
-    self._max_batch_size_bytes = max_batch_size_bytes
-    self._max_num_mutations = max_num_mutations
-    self._schema_view = schema_view
-
-  def expand(self, pcoll):
-
-    return (pcoll
-            | "making batches" >>
-            _WriteGroup(max_batch_size_bytes=self._max_batch_size_bytes)
-            | 'Writing to spanner' >> beam.ParDo(
-                _WriteToSpanner(self._project_id, self._instance_id,
-                                self._database_id)))
-
-
-class _BatchFn(beam.DoFn):
+class _BatchFn(DoFn):
+  """
+  Batches mutations together.
+  """
 
   def __init__(
       self,
@@ -815,9 +792,10 @@ class _BatchFn(beam.DoFn):
   def process(self, element):
     _max_bytes = self._max_batch_size_bytes
     mg = element
-    mg_size = mg.byte_size
+    mg_size = mg.byte_size  # total size of the mutation group.
 
     if mg_size + self._size_in_bytes > _max_bytes:
+      # Batch is full, output the batch and reseting the count.
       yield self._batch
       self._size_in_bytes = 0
       self._batch = MutationGroup()
@@ -830,7 +808,11 @@ class _BatchFn(beam.DoFn):
     self._batch = None
 
 
-class _BatchableFilterFn(beam.DoFn):
+class _BatchableFilterFn(DoFn):
+  """
+  Filters MutationGroups larger than the batch size to the output tagged with
+  OUTPUT_TAG_UNBATCHABLE.
+  """
   OUTPUT_TAG_UNBATCHABLE = 'unbatchable'
 
   def __init__(self, max_batch_size_bytes):
@@ -840,20 +822,19 @@ class _BatchableFilterFn(beam.DoFn):
 
   def process(self, element):
     if element.primary().operation == 'delete':
-      yield beam.pvalue.TaggedOutput(_BatchableFilterFn.OUTPUT_TAG_UNBATCHABLE,
-                                     element)
+      # As delete mutations are not batchable.
+      yield TaggedOutput(_BatchableFilterFn.OUTPUT_TAG_UNBATCHABLE, element)
     else:
       _max_bytes = self._max_batch_size_bytes
       mg = element
       mg_size = mg.byte_size
       if mg_size > _max_bytes:
-        yield beam.pvalue.TaggedOutput(
-            _BatchableFilterFn.OUTPUT_TAG_UNBATCHABLE, element)
+        yield TaggedOutput(_BatchableFilterFn.OUTPUT_TAG_UNBATCHABLE, element)
       else:
         yield element
 
 
-class _WriteToSpanner(beam.DoFn):
+class _WriteToSpannerDoFn(DoFn):
 
   def __init__(self, project_id, instance_id, database_id):
     self._project_id = project_id
@@ -865,6 +846,7 @@ class _WriteToSpanner(beam.DoFn):
 
   def to_runner_api_parameter(self, unused_context):
     pass
+    # return self.to_runner_api_pickled(unused_context)
 
   def setup(self):
     spanner_client = Client(self._project_id)
@@ -872,16 +854,16 @@ class _WriteToSpanner(beam.DoFn):
     self._db_instance = instance.database(self._database_id)
 
   def process(self, element):
-    # return element
     self.queries.inc(len(element))
     self.batches.inc()
     with self._db_instance.batch() as b:
       b._mutations.extend([x.mutation for x in element])
 
-    # yield [b.committed]
-
 
 class _MakeMutationGroupsFn(DoFn):
+  """
+  Make Mutation group object if the element is the instance of _Mutator.
+  """
 
   def process(self, element):
     if isinstance(element, MutationGroup):
@@ -890,13 +872,13 @@ class _MakeMutationGroupsFn(DoFn):
       yield MutationGroup([element])
     else:
       raise ValueError(
-          "Invalid object type. Object must be an intance of MutationGroup or "
+          "Invalid object type. Object must be an instance of MutationGroup or "
           "WriteMutations")
 
 
 class _WriteGroup(PTransform):
 
-  def __init__(self, max_batch_size_bytes=1024, *args, **kwargs):
+  def __init__(self, max_batch_size_bytes=1024):
     self._max_batch_size_bytes = max_batch_size_bytes
 
   def expand(self, pcoll):
@@ -905,15 +887,15 @@ class _WriteGroup(PTransform):
         | 'Making mutation groups' >> ParDo(
             _MakeMutationGroupsFn()).with_input_types(
                 typing.Union[MutationGroup, _Mutator])
-        | 'Filtering Batchable Murations' >> beam.ParDo(
+        | 'Filtering Batchable Mutations' >> ParDo(
             _BatchableFilterFn(self._max_batch_size_bytes)).with_outputs(
                 _BatchableFilterFn.OUTPUT_TAG_UNBATCHABLE, main='batchable'))
 
     batching_batchables = (
         filter_batchable_mutations['batchable']
-        | beam.ParDo(_BatchFn(self._max_batch_size_bytes)))
+        | ParDo(_BatchFn(self._max_batch_size_bytes)))
 
     return (
         (batching_batchables,
          filter_batchable_mutations[_BatchableFilterFn.OUTPUT_TAG_UNBATCHABLE])
-        | 'Merging batchable and unbatchable' >> beam.Flatten())
+        | 'Merging batchable and unbatchable' >> Flatten())
