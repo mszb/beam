@@ -207,8 +207,8 @@ class _BeamSpannerConfiguration(namedtuple(
       snapshot_options['read_timestamp'] = self.snapshot_read_timestamp
     return snapshot_options
 
-@with_input_types(ReadOperation, typing.Dict)
-@with_output_types(typing.List)
+@with_input_types(ReadOperation, typing.Dict[typing.Any, typing.Any])
+@with_output_types(typing.List[typing.Any])
 class _NaiveSpannerReadDoFn(DoFn):
 
   def __init__(self, spanner_configuration):
@@ -317,7 +317,7 @@ class _CreateReadPartitions(DoFn):
       self._snapshot.close()
 
 @with_input_types(int)
-@with_output_types(typing.Dict)
+@with_output_types(typing.Dict[typing.Any, typing.Any])
 class _CreateTransactionFn(DoFn):
   """
   A DoFn to create the transaction of cloud spanner.
@@ -396,7 +396,7 @@ def create_transaction(pbegin, project_id, instance_id, database_id,
       exact_staleness)))
 
 @with_input_types(typing.Dict[typing.Any, typing.Any])
-@with_output_types(typing.List)
+@with_output_types(typing.List[typing.Any])
 class _ReadFromPartitionFn(DoFn):
   """
   A DoFn to perform reads from the partition.
