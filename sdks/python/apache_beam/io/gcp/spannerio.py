@@ -646,7 +646,7 @@ class WriteToSpanner(PTransform):
                             self._database_id)))
 
 
-class _Mutator(namedtuple('_Mutator', ["mutation", "operation"])):
+class _Mutator(namedtuple('_Mutator', ["mutation", "operation", "kwargs"])):
   __slots__ = ()
 
   @property
@@ -757,7 +757,8 @@ class WriteMutation(object):
     """
     return _Mutator(
       mutation=Mutation(insert=batch._make_write_pb(table, columns, values)),
-      operation='insert')
+      operation='insert', kwargs={"table": table, "columns": columns,
+                                  "values": values})
 
   @staticmethod
   def update(table, columns, values):
@@ -769,7 +770,8 @@ class WriteMutation(object):
     """
     return _Mutator(
       mutation=Mutation(update=batch._make_write_pb(table, columns, values)),
-      operation='update')
+      operation='update', kwargs={"table": table, "columns": columns,
+                                  "values": values})
 
   @staticmethod
   def insert_or_update(table, columns, values):
@@ -782,7 +784,8 @@ class WriteMutation(object):
     return _Mutator(
       mutation=Mutation(
         insert_or_update=batch._make_write_pb(table, columns, values)),
-      operation='insert_or_update')
+      operation='insert_or_update', kwargs={"table": table, "columns": columns,
+                                            "values": values})
 
   @staticmethod
   def replace(table, columns, values):
@@ -794,7 +797,8 @@ class WriteMutation(object):
     """
     return _Mutator(
       mutation=Mutation(replace=batch._make_write_pb(table, columns, values)),
-      operation="replace")
+      operation="replace", kwargs={"table": table, "columns": columns,
+                                   "values": values})
 
   @staticmethod
   def delete(table, keyset):
@@ -804,7 +808,8 @@ class WriteMutation(object):
       keyset: Keys/ranges identifying rows to delete.
     """
     delete = Mutation.Delete(table=table, key_set=keyset._to_pb())
-    return _Mutator(mutation=Mutation(delete=delete), operation='delete')
+    return _Mutator(mutation=Mutation(delete=delete), operation='delete',
+                    kwargs={"table": table, "keyset": keyset})
 
 
 class _BatchFn(DoFn):
@@ -888,7 +893,12 @@ class _WriteToSpannerDoFn(DoFn):
   def process(self, element):
     self.batches.inc()
     with self._db_instance.batch() as b:
-      b._mutations.extend([x.mutation for x in element])
+      for m in element:
+        try:
+          fun = getattr(b, m.operation)
+          fun(**m.kwargs)
+        except AttributeError:
+          raise ValueError("Unknown operation action: %s" % m.operation)
 
 
 class _MakeMutationGroupsFn(DoFn):
